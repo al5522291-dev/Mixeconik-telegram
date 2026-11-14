@@ -1,0 +1,14 @@
+
+{
+  "name": "mixeconik-telegram-orders",
+  "version": "1.0.0",
+  "description": "Mixeconik Store order notification",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "puppeteer": "^24.10.2"
+  }
+}
