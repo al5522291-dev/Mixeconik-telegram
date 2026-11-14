@@ -1,63 +1,147 @@
 
 require("dotenv").config();
-const puppeteer = require("puppeteer");
+
+const puppeteer = require("puppeteer-core");
+const chromium = require("@sparticuz/chromium");
+const fs = require("fs");
+const path = require("path");
 
 // ======================================
 // MIXECONIK STORE - TELEGRAM ORDER BOT
+// Checks for new orders every 5 minutes
 // ======================================
 
-const CONFIG = {
-    url: process.env.ADMIN_URL,
-    username: process.env.ADMIN_USERNAME,
-    password: process.env.ADMIN_PASSWORD,
+const ADMIN_URL = process.env.ADMIN_URL;
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 
-    token: process.env.TELEGRAM_BOT_TOKEN,
-    chatId: process.env.TELEGRAM_CHAT_ID
-};
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-// ======================================
-// CSS SELECTORS - CUSTOMIZE THESE
-// ======================================
+const POLL_INTERVAL_MS =
+    Number(process.env.POLL_INTERVAL_MS) || 5 * 60 * 1000;
 
-const SELECTORS = {
+const SENT_FILE =
+    process.env.SENT_ORDERS_FILE ||
+    path.join(__dirname, "data", "sent-orders.json");
 
-    // Login form
-    username: "REPLACE_USERNAME_SELECTOR",
-    password: "REPLACE_PASSWORD_SELECTOR",
-    loginButton: "REPLACE_LOGIN_BUTTON_SELECTOR",
+let browser = null;
+let checking = false;
+let stopping = false;
+let intervalTimer = null;
 
-    // Orders section
-    ordersNav: "REPLACE_ORDERS_MENU_SELECTOR",
-    ordersSection: "REPLACE_ORDERS_SECTION_SELECTOR",
+// --------------------------------------
+// Validate environment variables
+// --------------------------------------
 
-    // Each order container
-    orderCard: "REPLACE_ORDER_CARD_SELECTOR",
+function validateConfig() {
+    const required = {
+        ADMIN_URL,
+        ADMIN_USERNAME,
+        ADMIN_PASSWORD,
+        TELEGRAM_BOT_TOKEN,
+        TELEGRAM_CHAT_ID
+    };
 
-    // Fields inside each order card
-    name: "REPLACE_CUSTOMER_NAME_SELECTOR",
-    phone: "REPLACE_PHONE_SELECTOR",
-    address: "REPLACE_ADDRESS_SELECTOR",
-    product: "REPLACE_PRODUCT_SELECTOR",
-    price: "REPLACE_PRICE_SELECTOR",
-    status: "REPLACE_STATUS_SELECTOR"
-};
+    const missing = Object.entries(required)
+        .filter(([, value]) => !value)
+        .map(([key]) => key);
 
-// ======================================
-// TELEGRAM MESSAGE FUNCTION
-// ======================================
+    if (missing.length) {
+        throw new Error(
+            "Missing environment variables: " + missing.join(", ")
+        );
+    }
 
-async function sendTelegram(message) {
+    if (!Number.isFinite(POLL_INTERVAL_MS) || POLL_INTERVAL_MS < 60000) {
+        throw new Error("POLL_INTERVAL_MS must be at least 60000.");
+    }
+}
 
-    const api =
-        `https://api.telegram.org/bot${CONFIG.token}/sendMessage`;
+// --------------------------------------
+// Sent order storage
+// --------------------------------------
 
-    const response = await fetch(api, {
+function readSentOrders() {
+    try {
+        if (!fs.existsSync(SENT_FILE)) {
+            return [];
+        }
+
+        const data = JSON.parse(
+            fs.readFileSync(SENT_FILE, "utf8")
+        );
+
+        return Array.isArray(data) ? data.map(String) : [];
+    } catch (error) {
+        console.error("Could not read sent orders:", error.message);
+        return [];
+    }
+}
+
+function saveSentOrders(ids) {
+    const directory = path.dirname(SENT_FILE);
+
+    fs.mkdirSync(directory, { recursive: true });
+
+    const temporaryFile = SENT_FILE + ".tmp";
+
+    fs.writeFileSync(
+        temporaryFile,
+        JSON.stringify(ids, null, 2),
+        "utf8"
+    );
+
+    fs.renameSync(temporaryFile, SENT_FILE);
+}
+
+// --------------------------------------
+// Launch Chromium browser
+// --------------------------------------
+
+async function getBrowser() {
+    if (browser && browser.connected) {
+        return browser;
+    }
+
+    console.log("Starting Chromium browser...");
+
+    browser = await puppeteer.launch({
+        args: [
+            ...chromium.args,
+            "--disable-dev-shm-usage"
+        ],
+        defaultViewport: {
+            width: 1366,
+            height: 900
+        },
+        executablePath: await chromium.executablePath(),
+        headless: true
+    });
+
+    browser.on("disconnected", () => {
+        console.log("Browser disconnected.");
+        browser = null;
+    });
+
+    return browser;
+}
+
+// --------------------------------------
+// Telegram message sender
+// --------------------------------------
+
+async function sendTelegramMessage(message) {
+    const url =
+        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+
+    const response = await fetch(url, {
         method: "POST",
         headers: {
             "Content-Type": "application/json"
         },
         body: JSON.stringify({
-            chat_id: CONFIG.chatId,
+            chat_id: TELEGRAM_CHAT_ID,
             text: message
         })
     });
@@ -66,185 +150,315 @@ async function sendTelegram(message) {
 
     if (!response.ok || !result.ok) {
         throw new Error(
-            "Telegram error: " + JSON.stringify(result)
+            result.description || "Telegram message failed"
         );
     }
 
-    console.log("Telegram message sent successfully!");
+    return result;
 }
 
-// ======================================
-// GET TEXT FROM ELEMENT
-// ======================================
+// --------------------------------------
+// Login to admin panel if required
+// --------------------------------------
 
-function getText(element, selector) {
+async function loginIfRequired(page) {
+    const usernameField = await page.$(
+        'input[name="username"]'
+    );
 
-    const found = element.querySelector(selector);
+    if (!usernameField) {
+        return;
+    }
 
-    return found
-        ? found.innerText.trim()
-        : "Not available";
-}
+    console.log("Admin login required. Logging in...");
 
-// ======================================
-// MAIN AUTOMATION
-// ======================================
+    await page.type(
+        'input[name="username"]',
+        ADMIN_USERNAME
+    );
 
-async function main() {
+    await page.type(
+        'input[type="password"][name="password"]',
+        ADMIN_PASSWORD
+    );
 
-    let browser;
+    await page.click('button[name="login"]');
 
-    try {
+    await page.waitForFunction(
+        () => !document.querySelector('input[name="username"]'),
+        { timeout: 20000 }
+    ).catch(() => {});
 
-        if (
-            !CONFIG.url ||
-            !CONFIG.username ||
-            !CONFIG.password ||
-            !CONFIG.token ||
-            !CONFIG.chatId
-        ) {
-            throw new Error("Missing .env configuration");
-        }
+    const stillLogin = await page.$(
+        'input[name="username"]'
+    );
 
-        browser = await puppeteer.launch({
-            headless: true,
-            args: ["--no-sandbox", "--disable-setuid-sandbox"]
-        });
-
-        const page = await browser.newPage();
-
-        page.setDefaultTimeout(20000);
-
-        console.log("Opening Mixeconik Admin...");
-
-        await page.goto(CONFIG.url, {
-            waitUntil: "domcontentloaded"
-        });
-
-        // ==================================
-        // ADMIN LOGIN
-        // ==================================
-
-        console.log("Entering admin credentials...");
-
-        await page.waitForSelector(SELECTORS.username);
-        await page.waitForSelector(SELECTORS.password);
-
-        await page.locator(SELECTORS.username)
-            .fill(CONFIG.username);
-
-        await page.locator(SELECTORS.password)
-            .fill(CONFIG.password);
-
-        await Promise.all([
-            page.locator(SELECTORS.loginButton).click(),
-            page.waitForNavigation({
-                waitUntil: "domcontentloaded",
-                timeout: 15000
-            }).catch(() => null)
-        ]);
-
-        console.log("Login submitted.");
-
-        // ==================================
-        // OPEN ORDERS SECTION
-        // ==================================
-
-        await page.waitForSelector(SELECTORS.ordersNav);
-
-        await page.locator(SELECTORS.ordersNav).click();
-
-        await page.waitForSelector(
-            SELECTORS.ordersSection
+    if (stillLogin) {
+        throw new Error(
+            "Admin login failed. Check ADMIN_USERNAME and ADMIN_PASSWORD."
         );
+    }
 
-        console.log("Orders section opened.");
+    console.log("Admin login successful.");
+}
 
-        // ==================================
-        // EXTRACT ORDER DETAILS
-        // ==================================
+// --------------------------------------
+// Open Order Details section
+// --------------------------------------
 
-        const orders = await page.evaluate((s) => {
+function getOrdersUrl() {
+    const url = new URL(ADMIN_URL);
+    url.searchParams.set("section", "orders");
+    return url.toString();
+}
 
-            const cards = document.querySelectorAll(
-                s.orderCard
+async function openOrdersPage(page) {
+    await page.goto(getOrdersUrl(), {
+        waitUntil: "domcontentloaded",
+        timeout: 60000
+    });
+
+    await loginIfRequired(page);
+
+    // If login redirected to another page, open orders again.
+    if (!page.url().includes("section=orders")) {
+        await page.goto(getOrdersUrl(), {
+            waitUntil: "domcontentloaded",
+            timeout: 60000
+        });
+    }
+
+    await page.waitForSelector("#ordersSection", {
+        timeout: 20000
+    });
+
+    await page.waitForSelector("article.order", {
+        timeout: 20000
+    }).catch(() => {
+        // No orders may be present.
+    });
+}
+
+// --------------------------------------
+// Extract order information
+// --------------------------------------
+
+async function extractOrders(page) {
+    return await page.$$eval("article.order", elements => {
+        return elements.map(order => {
+            const heading = order.querySelector("h3");
+
+            const title = heading
+                ? heading.innerText.trim()
+                : "Unknown Order";
+
+            const details = {};
+
+            order.querySelectorAll(".detail").forEach(detail => {
+                const labelElement = detail.querySelector("strong");
+
+                if (!labelElement) return;
+
+                const label = labelElement.innerText
+                    .replace(/:/g, "")
+                    .trim()
+                    .toLowerCase();
+
+                const clone = detail.cloneNode(true);
+                const strong = clone.querySelector("strong");
+
+                if (strong) {
+                    strong.remove();
+                }
+
+                details[label] = clone.innerText
+                    .replace(/\s+/g, " ")
+                    .trim();
+            });
+
+            const match = title.match(
+                /Order\s*#?\s*([A-Za-z0-9_-]+)/i
             );
 
-            function text(card, selector) {
-                const el = card.querySelector(selector);
-                return el
-                    ? el.innerText.trim()
-                    : "Not available";
+            return {
+                id: match ? match[1] : title,
+                title,
+                name: details["customer name"] || "",
+                phone: details["phone number"] || "",
+                address: details["full address"] || "",
+                product: details["product"] || "",
+                unitPrice: details["unit price"] || "",
+                quantity: details["quantity"] || "",
+                total: details["total"] || "",
+                payment: details["payment"] || "",
+                orderDate: details["order date"] || "",
+                status: details["delivery status"] || ""
+            };
+        });
+    });
+}
+
+// --------------------------------------
+// Format Telegram message
+// --------------------------------------
+
+function createTelegramMessage(order) {
+    return [
+        "📦 NEW MIXECONIK STORE ORDER",
+        "",
+        `🧾 Order: ${order.title}`,
+        "",
+        `👤 Customer: ${order.name || "Not available"}`,
+        `📞 Phone: ${order.phone || "Not available"}`,
+        `📍 Address: ${order.address || "Not available"}`,
+        "",
+        `🛍 Product: ${order.product || "Not available"}`,
+        `💰 Unit Price: ${order.unitPrice || "Not available"}`,
+        `🔢 Quantity: ${order.quantity || "Not available"}`,
+        `💵 Total: ${order.total || "Not available"}`,
+        "",
+        `💳 Payment: ${order.payment || "Not available"}`,
+        `📅 Order Date: ${order.orderDate || "Not available"}`,
+        `🚚 Delivery Status: ${order.status || "Not available"}`
+    ].join("\n");
+}
+
+// --------------------------------------
+// Check for new orders
+// --------------------------------------
+
+async function checkNewOrders() {
+    if (checking || stopping) {
+        return;
+    }
+
+    checking = true;
+
+    let page = null;
+
+    try {
+        console.log(
+            "\nChecking orders:",
+            new Date().toISOString()
+        );
+
+        const activeBrowser = await getBrowser();
+
+        page = await activeBrowser.newPage();
+
+        await openOrdersPage(page);
+
+        const orders = await extractOrders(page);
+
+        console.log(`Found ${orders.length} order(s).`);
+
+        const sentOrders = new Set(readSentOrders());
+
+        let newCount = 0;
+
+        for (const order of orders) {
+            if (stopping) break;
+
+            const orderId = String(order.id);
+
+            if (sentOrders.has(orderId)) {
+                continue;
             }
 
-            return Array.from(cards).map(card => ({
-                name: text(card, s.name),
-                phone: text(card, s.phone),
-                address: text(card, s.address),
-                product: text(card, s.product),
-                price: text(card, s.price),
-                status: text(card, s.status)
-            }));
+            try {
+                const message = createTelegramMessage(order);
 
-        }, SELECTORS);
+                await sendTelegramMessage(message);
 
-        console.log("Orders found:", orders.length);
+                sentOrders.add(orderId);
 
-        // ==================================
-        // SEND ORDER DETAILS TO TELEGRAM
-        // ==================================
+                // Save immediately after successful delivery.
+                saveSentOrders([...sentOrders]);
 
-        if (orders.length === 0) {
+                newCount++;
 
-            console.log("No orders found.");
-
-        } else {
-
-            for (let i = 0; i < orders.length; i++) {
-
-                const order = orders[i];
-
-                const message = `
-🛒 MIXECONIK STORE
-📦 NEW ORDER DETAILS
-
-━━━━━━━━━━━━━━━━
-
-👤 Customer: ${order.name}
-
-📞 Phone: ${order.phone}
-
-🏠 Delivery Address:
-${order.address}
-
-🛍 Product: ${order.product}
-
-💰 Price: ${order.price}
-
-📌 Status: ${order.status}
-
-━━━━━━━━━━━━━━━━
-Order Number: ${i + 1}
-
-Mixeconik Store
-                `.trim();
-
-                await sendTelegram(message);
+                console.log(
+                    `Telegram notification sent: ${order.title}`
+                );
+            } catch (error) {
+                console.error(
+                    `Failed to send ${order.title}:`,
+                    error.message
+                );
             }
         }
 
-        console.log("Automation completed.");
+        console.log(
+            `Check completed. New notifications: ${newCount}`
+        );
 
     } catch (error) {
-
-        console.error("Automation failed:", error);
+        console.error("Order checking error:", error.message);
 
     } finally {
-
-        if (browser) {
-            await browser.close();
+        if (page) {
+            await page.close().catch(() => {});
         }
+
+        checking = false;
     }
 }
 
-main();
+// --------------------------------------
+// Start 5-minute checking loop
+// --------------------------------------
+
+async function startBot() {
+    validateConfig();
+
+    console.log("----------------------------------");
+    console.log("MIXECONIK STORE TELEGRAM BOT");
+    console.log("Automatic order checking started");
+    console.log(
+        `Interval: ${POLL_INTERVAL_MS / 60000} minutes`
+    );
+    console.log("----------------------------------");
+
+    // Run once immediately after startup.
+    await checkNewOrders();
+
+    // Repeat every configured interval.
+    intervalTimer = setInterval(() => {
+        checkNewOrders();
+    }, POLL_INTERVAL_MS);
+}
+
+// --------------------------------------
+// Graceful shutdown for Railway
+// --------------------------------------
+
+async function shutdown(signal) {
+    if (stopping) return;
+
+    console.log(`\nReceived ${signal}. Shutting down...`);
+
+    stopping = true;
+
+    if (intervalTimer) {
+        clearInterval(intervalTimer);
+    }
+
+    if (browser) {
+        await browser.close().catch(() => {});
+        browser = null;
+    }
+
+    process.exit(0);
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+// --------------------------------------
+// Run application
+// --------------------------------------
+
+startBot().catch(error => {
+    console.error("Startup error:", error);
+    process.exit(1);
+});

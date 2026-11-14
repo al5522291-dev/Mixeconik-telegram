@@ -1,14 +1,18 @@
 
 {
-  "name": "mixeconik-telegram-orders",
-  "version": "1.0.0",
-  "description": "Mixeconik Store order notification",
+  "name": "mixeconik-telegram-order-bot",
+  "version": "2.0.0",
+  "description": "Automatic Mixeconik Store order notifications to Telegram",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
+    "@sparticuz/chromium": "^138.0.2",
     "dotenv": "^16.4.7",
-    "puppeteer": "^24.10.2"
+    "puppeteer-core": "^24.10.2"
   }
 }
