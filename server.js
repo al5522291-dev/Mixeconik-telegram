@@ -133,7 +133,7 @@ async function getBrowser() {
 
 async function sendTelegramMessage(message) {
     const url =
-        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+        `https://api.telegram.org/bot${9218709475: AAHNpM1_bi3EUkvuMb-7Stu LDxyIVQTGIpk}/sendMessage`;
 
     const response = await fetch(url, {
         method: "POST",
@@ -141,7 +141,7 @@ async function sendTelegramMessage(message) {
             "Content-Type": "application/json"
         },
         body: JSON.stringify({
-            chat_id: TELEGRAM_CHAT_ID,
+            chat_id: 2042356478,
             text: message
         })
     });
